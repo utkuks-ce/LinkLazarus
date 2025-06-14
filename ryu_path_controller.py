@@ -1,3 +1,7 @@
+# Ryu controller file: ryu_path_controller.py (or whatever you named it)
+
+import os
+# Diğer importlar zaten duruyor...
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -13,10 +17,15 @@ class SimpleTopology(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
+        
         super(SimpleTopology, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.net = {}
         self.installed_flows = set()
+
+    def is_emergency(self):
+        """Emergency flag kontrol edilir."""
+        return os.path.exists("/tmp/emergency.flag")
 
     @set_ev_cls(EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -77,9 +86,13 @@ class SimpleTopology(app_manager.RyuApp):
 
         self.logger.info("📤 FlowMod gönderiliyor: %s", match)
         datapath.send_msg(mod)
-
+        
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        if self.is_emergency():
+            self.logger.warning("🚨 Emergency mode active: dropping all packets")
+            return
+
         msg = ev.msg
         datapath = msg.datapath
         dpid = datapath.id
@@ -97,21 +110,15 @@ class SimpleTopology(app_manager.RyuApp):
         eth_type = eth.ethertype
         src_mac = eth.src
         dst_mac = eth.dst
-        if eth_type == ether_types.ETH_TYPE_LLDP or dst_mac.startswith("01:80"):
-            # LLDP: flood etme, kontrolöre gönderiyoruz zaten
-            #self.logger.info("🚫 LLDP paketi atlandı.")
-            return
 
-        if dst_mac.startswith("33:33") or dst_mac.startswith("01:00:5e"):
-            # IPv6 ve IGMP Multicast → flood istemiyorsan:
-            #self.logger.info("🚫 Multicast paket atlandı: %s", dst_mac)
+        if eth_type == ether_types.ETH_TYPE_LLDP or dst_mac.startswith("01:80"):
+            self.logger.info("🚫 LLDP/STP paketi atlandı.")
             return
 
         self.logger.info("📥 PacketIn: Switch %s, Port %s, %s ➝ %s", dpid, in_port, src_mac, dst_mac)
 
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src_mac] = in_port
-
         self.logger.info("🧠 MAC Tablosu [%s]: %s", dpid, self.mac_to_port[dpid])
 
         if dst_mac in self.mac_to_port[dpid]:
@@ -121,16 +128,16 @@ class SimpleTopology(app_manager.RyuApp):
             flow_key = (dpid, src_mac, dst_mac)
 
             if flow_key not in self.installed_flows:
-                self.logger.info("➕ Yeni flow eklenecek: %s → %s | Out Port: %s", src_mac, dst_mac, out_port)
+                self.logger.info("➕ Yeni flow: %s → %s | Port: %s", src_mac, dst_mac, out_port)
                 self.add_flow(datapath, priority=10, match=match, actions=actions, idle_timeout=0)
                 self.installed_flows.add(flow_key)
-                self.logger.info("✅ Flow eklendi ve kaydedildi: %s", flow_key)
+                self.logger.info("✅ Flow eklendi: %s", flow_key)
             else:
-                self.logger.info("⏩ Zaten var olan flow: %s", flow_key)
+                self.logger.info("⏩ Flow zaten var: %s", flow_key)
         else:
             out_port = ofproto.OFPP_FLOOD
             actions = [parser.OFPActionOutput(out_port)]
-            self.logger.info("🌊 dst_mac (%s) bilinmiyor, FLOOD ediliyor", dst_mac)
+            self.logger.info("🌊 dst_mac (%s) bilinmiyor, FLOOD.", dst_mac)
 
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
 
