@@ -4,7 +4,7 @@ import time
 import logging
 
 # ==== Ayarlar ====
-PI_IPS = ["192.168.1.101", "192.168.1.102", "192.168.1.103", "192.168.1.104", "192.168.1.105"]
+PI_IPS = ["192.168.1.2", "192.168.56.3", "192.168.1.4", "192.168.1.5"]
 PORT = 5000
 HEARTBEAT_INTERVAL = 3  # saniye
 TIMEOUT = 2  # request timeout süresi
