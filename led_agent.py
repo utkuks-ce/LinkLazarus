@@ -1,11 +1,11 @@
-#Run on pi
-#Run with: sudo -E python3 led_agent.py --iface eth0 --iface eth1
 #!/usr/bin/env python3
 # led_agent.py
 # Requirements: sudo apt-get install -y python3-gpiozero python3-scapy
-# Run (örnek): sudo -E python3 led_agent.py --iface eth0 --window 5
+# Run (single iface):   sudo -E python3 led_agent.py --iface eth0
+# Run (multi-iface):    sudo -E python3 led_agent.py --iface eth0 --iface eth1
+# Run (auto/"any"):     sudo -E python3 led_agent.py
 # Emergency test: echo -n "EMERG 1" | nc -u <pi_ip> 9999   (ON)
-#                 echo -n "EMERG 0" | nc -u <pi_ip> 9999   (OFF)
+#                  echo -n "EMERG 0" | nc -u <pi_ip> 9999   (OFF)
 
 import argparse
 import threading
@@ -13,19 +13,19 @@ import socket
 import time
 import signal
 import sys
-from typing import Optional, List
+from typing import Optional, List, Union
 
 from gpiozero import LED
-from scapy.all import sniff, Ether  # LLDP = ethertype 0x88cc
+from scapy.all import sniff, Ether, get_if_list  # LLDP: ethertype 0x88cc
 
 # ------------------- Defaults -------------------
 GREEN_PIN = 17
 RED_PIN   = 27
 
 LLDP_ETHERTYPE = 0x88CC
-DEFAULT_WINDOW_SEC = 4.0       # LLDP görülmezse bu süre sonunda "disconnected"
-DOWN_GRACE_SEC     = 1.0       # connected->disconnected geçişinde histerezis
-RENDER_PERIOD_SEC  = 0.20      # LED renderer loop interval
+DEFAULT_LLDP_OK_WINDOW_SEC = 6.0   # LLDP görülmezse bu süre sonunda "connected" değil say
+DEFAULT_DOWN_GRACE_SEC     = 1.0   # connected->disconnected geçişinde histerezis
+RENDER_PERIOD_SEC          = 0.20  # LED renderer loop interval
 
 EMERG_UDP_PORT = 9999
 EMERG_ON_STRINGS  = {"EMERG 1", "EMERGENCY 1", "EMERGENCY ON", "EMERG ON", "ON"}
@@ -40,16 +40,15 @@ emergency = False
 
 stop_event = threading.Event()
 
-# GPIO
+# CLI ile set edilecekler
+LLDP_OK_WINDOW_SEC: float = DEFAULT_LLDP_OK_WINDOW_SEC
+DOWN_GRACE_SEC: float = DEFAULT_DOWN_GRACE_SEC
+IFACES: Optional[List[str]] = None  # None => otomatik seçim
+
+# ------------------- LED helpers -------------------
 green = LED(GREEN_PIN)
 red   = LED(RED_PIN)
 
-# Arg-parsed config (runtime)
-IFACES: List[str] = []
-LLDP_OK_WINDOW_SEC: float = DEFAULT_WINDOW_SEC
-
-
-# ------------------- LED helpers -------------------
 def set_green(mode: str):
     if mode == "off":
         green.off()
@@ -71,31 +70,28 @@ def set_red(mode: str):
         red.off()
 
 def compute_led_modes(now: float):
-    # priority: emergency > connected > disconnected
+    """
+    Öncelik: emergency > connected > disconnected
+    """
     with emergency_lock:
         is_emerg = emergency
     if is_emerg:
-        return ("off", "solid")
+        return ("off", "solid")  # green off, red solid
 
     with last_lldp_seen_lock:
         seen = last_lldp_seen
 
-    if seen is None:
-        connected = False
-    else:
-        age = now - seen
-        connected = age <= LLDP_OK_WINDOW_SEC
+    connected = (seen is not None) and ((now - seen) <= LLDP_OK_WINDOW_SEC)
 
     if connected:
-        return ("solid", "off")
+        return ("solid", "off")        # green solid
     else:
-        return ("off", "blink_slow")
-
+        return ("off", "blink_slow")   # red slow blink
 
 # ------------------- Threads -------------------
 def lldp_sniffer():
     """
-    Seçilen arayüz(ler)de LLDP (0x88cc) gördüğünde zaman damgasını günceller.
+    Seçili iface(ler) üzerinden LLDP (0x88cc) dinler; paket gördükçe zaman damgasını günceller.
     """
     def on_pkt(pkt):
         if not pkt.haslayer(Ether):
@@ -107,16 +103,32 @@ def lldp_sniffer():
         with last_lldp_seen_lock:
             global last_lldp_seen
             last_lldp_seen = now
-        # arada bir log
-        print(f"[LLDP] frame seen at t={now:.3f}")
+        # Çok log basmak istemezsen yorumsuz bırak:
+        # print(f"[LLDP] seen at {now:.3f}")
+
+    # iface seçim mantığı:
+    # - IFACES listesi verilmişse onu kullan (list ver)
+    # - verilmemişse önce 'any' arayüzünü dene (Linux'ta tüm arayüzler)
+    # - 'any' yoksa/çalışmazsa iface parametresiz (Scapy default)
+    iface_arg: Union[None, str, List[str]]
+    if IFACES:
+        iface_arg = IFACES
+        print(f"[BOOT] Sniffing LLDP on IFACES={iface_arg}")
+    else:
+        try:
+            # 'any' arayüzü çoğu Linux'ta vardır; listede olmasa da pcap destekliyorsa çalışır
+            iface_arg = "any"
+            print("[BOOT] No --iface provided; trying 'any' (all interfaces)")
+        except Exception:
+            iface_arg = None
+            print("[BOOT] No --iface provided; using Scapy default interface")
 
     try:
-        print(f"[BOOT] Sniffing LLDP on ifaces: {IFACES or ['<auto>']}, window={LLDP_OK_WINDOW_SEC}s")
         sniff(
-            iface=IFACES if IFACES else None,    # none => scapy kendi seçer (linux’ta genelde 'any')
             prn=on_pkt,
             filter="ether proto 0x88cc",
             store=0,
+            iface=iface_arg,  # list | "any" | None
             stop_filter=lambda _: stop_event.is_set()
         )
     except Exception as e:
@@ -152,11 +164,12 @@ def led_renderer():
     print("[BOOT] LED renderer started")
     while not stop_event.is_set():
         now = time.time()
-
-        # küçük bir grace: bağlantı kopuşunda hemen kırmızıya düşmemek için
+        # kısa histerezis: kırmızıya dönmeden önce ufak bekleme
         with last_lldp_seen_lock:
             seen = last_lldp_seen
-        if seen is not None and (now - seen) > LLDP_OK_WINDOW_SEC and (now - seen) < (LLDP_OK_WINDOW_SEC + DOWN_GRACE_SEC):
+        if (seen is not None and
+            (now - seen) > LLDP_OK_WINDOW_SEC and
+            (now - seen) < (LLDP_OK_WINDOW_SEC + DOWN_GRACE_SEC)):
             modes = ("solid", "off")
         else:
             modes = compute_led_modes(now)
@@ -170,7 +183,6 @@ def led_renderer():
 
         time.sleep(RENDER_PERIOD_SEC)
 
-
 # ------------------- Signal handling -------------------
 def cleanup_and_exit(signum=None, frame=None):
     print("[EXIT] Stopping threads and cleaning up GPIO...")
@@ -182,25 +194,36 @@ def cleanup_and_exit(signum=None, frame=None):
         pass
     sys.exit(0)
 
+signal.signal(signal.SIGINT, cleanup_and_exit)
+signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+# ------------------- CLI -------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="LED agent: LLDP heartbeat + emergency override")
+    p.add_argument("--iface", action="append",
+                   help="Interface(s) to sniff LLDP on. Repeat for multiple "
+                        "(e.g., --iface eth0 --iface eth1). If omitted, tries 'any', "
+                        "else Scapy default.")
+    p.add_argument("--lldp-window", type=float, default=DEFAULT_LLDP_OK_WINDOW_SEC,
+                   help=f"Seconds to consider connected after last LLDP seen (default: {DEFAULT_LLDP_OK_WINDOW_SEC:.1f})")
+    p.add_argument("--down-grace", type=float, default=DEFAULT_DOWN_GRACE_SEC,
+                   help=f"Hysteresis seconds before turning red after LLDP gap (default: {DEFAULT_DOWN_GRACE_SEC:.1f})")
+    return p.parse_args()
 
 # ------------------- Main -------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LLDP heartbeat + emergency LED agent")
-    parser.add_argument("--iface", action="append", help="Interface(s) to sniff LLDP on (repeatable), e.g. --iface eth0", default=[])
-    parser.add_argument("--window", type=float, default=DEFAULT_WINDOW_SEC, help="LLDP ok window in seconds")
-    args = parser.parse_args()
-
-    IFACES = args.iface or []       # boş ise scapy auto
-    LLDP_OK_WINDOW_SEC = float(args.window)
-
-    signal.signal(signal.SIGINT, cleanup_and_exit)
-    signal.signal(signal.SIGTERM, cleanup_and_exit)
+    args = parse_args()
+    IFACES = args.iface
+    LLDP_OK_WINDOW_SEC = args.lldp_window
+    DOWN_GRACE_SEC = args.down_grace
 
     print("[BOOT] LED Agent starting (LLDP heartbeat + emergency override)")
+    print(f"[BOOT] Params: IFACES={IFACES if IFACES else '(auto)'}  "
+          f"LLDP_WINDOW={LLDP_OK_WINDOW_SEC}s  DOWN_GRACE={DOWN_GRACE_SEC}s")
+
     # küçük başlangıç animasyonu
     green.blink(on_time=0.2, off_time=0.2, n=3, background=False)
-    red.off()
-    green.off()
+    red.off(); green.off()
 
     t1 = threading.Thread(target=lldp_sniffer, daemon=True)
     t2 = threading.Thread(target=emergency_listener, daemon=True)
@@ -208,5 +231,6 @@ if __name__ == "__main__":
 
     t1.start(); t2.start(); t3.start()
 
+    # Sonsuz bekleme
     while True:
         time.sleep(1.0)
