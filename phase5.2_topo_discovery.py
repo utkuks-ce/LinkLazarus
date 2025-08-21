@@ -8,6 +8,9 @@ from ryu.lib.packet import packet, ethernet, arp, ipv4
 from ryu.lib.packet import ether_types
 import networkx as nx
 import time
+from ryu.topology import switches as topo_switches  # Ryu’nun hazır LLDPPacket helper’ı
+from ryu.lib import hub  # periyodik beacon için
+
 
 
 class LLDPPathController(app_manager.RyuApp):
@@ -41,10 +44,189 @@ class LLDPPathController(app_manager.RyuApp):
         import threading
         threading.Thread(target=self._emerg_cmd_listener, daemon=True).start()
         self.logger.info("[EMERG] UDP command listener on 0.0.0.0:%d", self.EMERG_UDP_PORT)
+        # --- Fast LLDP beacon (for LED heartbeat) ---
+        self.fast_lldp_period = 1.0  # istersen 0.5 yapabilirsin
+        self.fast_lldp_thread = hub.spawn(self.fast_lldp_loop)
+        self.logger.info(f"[BOOT] Fast-LLDP beacon started (period={self.fast_lldp_period}s)")
+
+
+
 
     # ---------- helpers ----------
     def now(self) -> float:
         return time.time()
+    # ---------- FAST LLDP BEACON (for LED heartbeat) ----------
+    
+
+    def _iter_physical_ports(self, dp):
+        """Return generator of physical port numbers (excludes LOCAL and specials)."""
+        ofp = dp.ofproto
+        ports = getattr(dp, "ports", {})
+        for port_no, ofp_port in ports.items():
+            try:
+                if 0 < port_no < ofp.OFPP_MAX and port_no != ofp.OFPP_LOCAL:
+                    return_port = int(port_no)
+                    yield return_port
+            except Exception:
+                continue
+    def program_ipv6_drop(self):
+        COOKIE_V6_DROP = 0xA1A2A3A400000006
+        for dpid, dp in self.datapaths.items():
+            parser, ofp = dp.ofproto_parser, dp.ofproto
+            # Eski kuralı sil
+            mod = parser.OFPFlowMod(datapath=dp, command=ofp.OFPFC_DELETE,
+                                    out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                                    match=parser.OFPMatch(eth_type=0x86DD),
+                                    cookie=COOKIE_V6_DROP, cookie_mask=0xFFFFFFFFFFFFFFFF,
+                                    table_id=ofp.OFPTT_ALL)
+            dp.send_msg(mod)
+            # Yeni: IPv6 drop (prio 2, table-miss'ten yüksek)
+            fm = parser.OFPFlowMod(datapath=dp, priority=2,
+                                match=parser.OFPMatch(eth_type=0x86DD),
+                                instructions=[], cookie=COOKIE_V6_DROP)
+            dp.send_msg(fm)
+            self.logger.info(f"[V6-DROP] DPID={dp.id} IPv6 drop installed")
+
+    def program_arp_ingress_rules(self):
+        """Edge portlardan gelen ARP'yi CONTROLLER'a mirrora et; inter-switch portlardan gelen ARP'yi drop et.
+        Böylece BFS ile enjekte ettiğimiz ARP kopyaları tekrar PacketIn oluşturmaz, flapping biter."""
+        """Edge portlardan gelen ARP -> CONTROLLER; inter-switch (uplink) ARP -> DROP; LOCAL -> CONTROLLER."""
+        COOKIE_ARP_ING = 0xA1A2A3A400000001
+
+        for dpid, dp in self.datapaths.items():
+            parser, ofp = dp.ofproto_parser, dp.ofproto
+
+            # Eski kuralları temizle
+            mod = parser.OFPFlowMod(datapath=dp, command=ofp.OFPFC_DELETE,
+                                    out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
+                                    match=parser.OFPMatch(),
+                                    cookie=COOKIE_ARP_ING, cookie_mask=0xFFFFFFFFFFFFFFFF,
+                                    table_id=ofp.OFPTT_ALL)
+            dp.send_msg(mod)
+
+            # LOCAL -> CONTROLLER (Linux host'tan gelen ARP)
+            match = parser.OFPMatch(in_port=ofp.OFPP_LOCAL, eth_type=0x0806)
+            actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+            inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+            flow = parser.OFPFlowMod(datapath=dp, priority=3, match=match,
+                                    instructions=inst, cookie=COOKIE_ARP_ING)
+            dp.send_msg(flow)
+
+            # Edge fiziksel portlar -> CONTROLLER
+            for p in self.edge_ports(dpid):
+                match = parser.OFPMatch(in_port=p, eth_type=0x0806)
+                actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+                inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+                flow = parser.OFPFlowMod(datapath=dp, priority=2, match=match,
+                                        instructions=inst, cookie=COOKIE_ARP_ING)
+                dp.send_msg(flow)
+
+            # Uplink (inter-switch) portlar -> DROP
+            uplinks = {pt for (sw, pt) in self.link_ports if sw == dpid}
+            for p in uplinks:
+                match = parser.OFPMatch(in_port=p, eth_type=0x0806)
+                inst = []  # drop
+                flow = parser.OFPFlowMod(datapath=dp, priority=2, match=match,
+                                        instructions=inst, cookie=COOKIE_ARP_ING)
+                dp.send_msg(flow)
+
+            self.logger.info(f"[ARP-ING] DPID={dp.id} local->ctrl, edge->ctrl, uplink->drop kuruldu")
+
+
+    def _send_fast_lldp_once(self, dp, port_no):
+        """Build & send one LLDP frame out of given port via PacketOut."""
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        dpid = dp.id
+
+        # Port MAC’i varsa kullan; yoksa dummy MAC da iş görür (LED agent sadece 'dpid:' arıyor).
+        try:
+            hw_addr = dp.ports[port_no].hw_addr
+        except Exception:
+            hw_addr = "02:00:00:00:00:01"
+
+        # Ryu’nun hazır helper’ı: 'dpid:%016x' içeren LLDP üretir
+        pkt = topo_switches.LLDPPacket.lldp_packet(dpid, port_no, hw_addr)
+        data = pkt.data
+
+        actions = [parser.OFPActionOutput(port_no)]
+        out = parser.OFPPacketOut(datapath=dp,
+                                buffer_id=ofp.OFP_NO_BUFFER,
+                                in_port=ofp.OFPP_CONTROLLER,
+                                actions=actions,
+                                data=data)
+        dp.send_msg(out)
+
+    def fast_lldp_loop(self):
+        """Periodically send LLDP out of every physical port on every switch."""
+        self.logger.info(f"[FAST-LLDP] Beacon loop started (period={self.fast_lldp_period}s)")
+        while True:
+            try:
+                for dpid, dp in list(self.datapaths.items()):
+                    for pno in self._iter_physical_ports(dp):
+                        try:
+                            self._send_fast_lldp_once(dp, pno)
+                        except Exception as e:
+                            self.logger.debug(f"[FAST-LLDP] send fail dpid={dpid} port={pno}: {e}")
+            except Exception as e:
+                self.logger.warning(f"[FAST-LLDP] loop error: {e}")
+            hub.sleep(self.fast_lldp_period)
+
+    def edge_ports(self, dpid):
+        dp = self.datapaths.get(dpid)
+        if not dp: return set()
+        ofp = dp.ofproto
+        phys = {pno for pno in getattr(dp, "ports", {}).keys()
+                if isinstance(pno, int) and 0 < pno < ofp.OFPP_MAX and pno != ofp.OFPP_LOCAL}
+        uplinks = {p for (sw, p) in self.link_ports if sw == dpid}
+        return phys - uplinks
+
+
+    def arp_broadcast_tree(self, src_dpid, in_port_on_src, data):
+        """Loopsuz ARP yayını: BFS ağacı; her node'da ÇOCUK kenarlara + OFPP_LOCAL + edge portlara kopyala."""
+        import networkx as nx
+        T = nx.bfs_tree(self.topology, source=src_dpid)  # directed parent->child
+
+        for u in T.nodes():
+            dp = self.datapaths.get(u)
+            if not dp:
+                continue
+            parser, ofp = dp.ofproto_parser, dp.ofproto
+
+            parent = next(iter(T.predecessors(u)), None) if hasattr(T, "predecessors") else None
+            parent_port = self.topology[u][parent]['port'] if parent and self.topology.has_edge(u, parent) else None
+
+            out_ports = set()
+
+            # Çocuklara giden kenarlar
+            for v in T.successors(u):
+                out_ports.add(self.topology[u][v]['port'])
+
+            # Bu switch'in host-facing edge portları (varsa)
+            out_ports |= self.edge_ports(u)
+
+            # LOCAL'a da ver ki o switch'teki Linux host ARP'yi görebilsin
+            out_ports.add(ofp.OFPP_LOCAL)
+
+            # Kökte giriş portunu çıkar
+            if u == src_dpid and in_port_on_src in out_ports:
+                out_ports.remove(in_port_on_src)
+            # Parent kenarı geri göndermeyi engelle
+            if parent_port in out_ports:
+                out_ports.remove(parent_port)
+
+            if not out_ports:
+                continue
+
+            actions = [parser.OFPActionOutput(p) for p in sorted(out_ports)]
+            out = parser.OFPPacketOut(datapath=dp,
+                                    buffer_id=ofp.OFP_NO_BUFFER,
+                                    in_port=ofp.OFPP_CONTROLLER,
+                                    actions=actions,
+                                    data=data)
+            dp.send_msg(out)
+            self.logger.debug(f"[ARP-TREE] DPID={u} fanout={sorted(out_ports)}")
+
 
     def update_topology(self):
         self.topology.clear()
@@ -73,6 +255,10 @@ class LLDPPathController(app_manager.RyuApp):
                     macmap.pop(mac, None)
                     self.mac_to_loc.pop(mac, None)
                     self.logger.info(f"[UNLEARN] DPID={dpid} mac={mac} removed (became inter-switch)")
+        self.program_arp_ingress_rules()
+        for sw in sorted(self.topology.nodes()):
+            self.logger.info(f"[PORTSETS] DPID={sw} edge={sorted(self.edge_ports(sw))} uplinks={sorted([p for (s,p) in self.link_ports if s==sw])}")  
+        self.program_ipv6_drop()  
 
 
 
@@ -318,7 +504,7 @@ class LLDPPathController(app_manager.RyuApp):
 
 
 
-    def flood(self, dp, in_port, data, reason="generic"):
+    """def flood(self, dp, in_port, data, reason="generic"):
         ofp = dp.ofproto
         parser = dp.ofproto_parser
         actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
@@ -328,7 +514,7 @@ class LLDPPathController(app_manager.RyuApp):
                                   actions=actions,
                                   data=data)
         dp.send_msg(out)
-        self.logger.info(f"[FLOOD] DPID={dp.id} IN={in_port} reason={reason}")
+        self.logger.info(f"[FLOOD] DPID={dp.id} IN={in_port} reason={reason}")"""
 
     # ---------- features / events ----------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -346,8 +532,13 @@ class LLDPPathController(app_manager.RyuApp):
         self.datapaths[dp.id] = dp
         self.logger.info(f"[FEATURES] Table-miss installed on DPID={dp.id}")
 
-        # Phase 3: low-priority ARP flood rule
+        # Phase 3: mirror only rule
         self.add_arp_flood_rule(dp, priority=1)
+        #self.program_arp_ingress_rules()
+        #for sw in sorted(self.topology.nodes()):
+        #    self.logger.info(f"[PORTSETS] DPID={sw} edge={sorted(self.edge_ports(sw))} uplinks={sorted([p for (s,p) in self.link_ports if s==sw])}")
+        self.program_ipv6_drop()
+
 
     def _is_physical_port(self, dp, port_no: int) -> bool:
         # Only learn on real ports (exclude LOCAL/CONTROLLER/etc.)
@@ -363,14 +554,13 @@ class LLDPPathController(app_manager.RyuApp):
         ofp = dp.ofproto
         parser = dp.ofproto_parser
         match = parser.OFPMatch(eth_type=0x0806)  # ARP
-        actions = [
-            parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER),  # ← mirror to controller
-            parser.OFPActionOutput(ofp.OFPP_FLOOD)                               # ← and flood in dataplane
-        ]
+        # Sadece controller'a kopyala (FLOOD YOK)
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=priority, match=match, instructions=inst)
         dp.send_msg(mod)
-        self.logger.info(f"[FEATURES] Low-priority ARP mirror+flood installed on DPID={dp.id}")
+        self.logger.info(f"[FEATURES] ARP mirror→controller installed on DPID={dp.id}")
+
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -633,10 +823,36 @@ class LLDPPathController(app_manager.RyuApp):
         # ARP?
         arp_pkt = pkt.get_protocol(arp.arp)
         if arp_pkt:
-            self.ip_to_mac[arp_pkt.src_ip] = eth.src
-            self.logger.info(f"[ARP] src_ip={arp_pkt.src_ip} src_mac={eth.src} op={arp_pkt.opcode}")
+            src_ip, src_mac = arp_pkt.src_ip, eth.src
+            self.ip_to_mac[src_ip] = src_mac
+            self.learn_host(dp.id, eth.src, in_port)
+
+            # PROXY-ARP: Request ve hedefi biliyorsak direkt yanıtla
+            if arp_pkt.opcode == arp.ARP_REQUEST:
+                target_ip = arp_pkt.dst_ip
+                dst_mac = self.ip_to_mac.get(target_ip)
+                if dst_mac and (dst_mac in self.mac_to_loc):
+                    # ARP reply paketini oluştur
+                    rep = packet.Packet()
+                    rep.add_protocol(ethernet.ethernet(dst=eth.src, src=dst_mac,
+                                                    ethertype=ether_types.ETH_TYPE_ARP))
+                    rep.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                            src_mac=dst_mac, src_ip=target_ip,
+                                            dst_mac=eth.src, dst_ip=src_ip))
+                    rep.serialize()
+                    actions = [parser.OFPActionOutput(in_port)]
+                    out = parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
+                                            in_port=ofp.OFPP_CONTROLLER,
+                                            actions=actions, data=rep.data)
+                    dp.send_msg(out)
+                    self.logger.info(f"[ARP] Proxy-ARP {target_ip} → {src_ip} on DPID={dp.id}")
+                    return
+
+            # Aksi halde loopsuz yayın ağacına ver
+            self.arp_broadcast_tree(dp.id, in_port, msg.data)
             self.print_hosts()
             return
+
 
 
         # IPv4?
@@ -708,11 +924,11 @@ class LLDPPathController(app_manager.RyuApp):
                     return
                 else:
                     self.logger.info(f"[IPv4] dst MAC known ({dst_mac_known}) but location unknown; flooding.")
-                    self.flood_edge_only(dp, in_port, msg.data, include_local=True, reason="dst_loc_unknown")
+        
                     return
             else:
                 self.logger.info(f"[IPv4] dst IP unknown ({dst_ip}); flooding to discover.")
-                self.flood_edge_only(dp, in_port, msg.data, include_local=True, reason="dst_ip_unknown")
+                
                 return
 
 
